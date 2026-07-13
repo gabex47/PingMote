@@ -3,6 +3,7 @@
 #include <cJSON.h>
 #include <curl/curl.h>
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -34,9 +35,13 @@ static bool is_https_url(const char *url)
 static size_t write_to_buffer(void *contents, size_t size, size_t count, void *user_data)
 {
     WriteBuffer *const buffer = user_data;
-    const size_t byte_count = size * count;
 
-    if (buffer == NULL || contents == NULL || (size != 0U && byte_count / size != count)) {
+    if (buffer == NULL || contents == NULL || (count != 0U && size > SIZE_MAX / count)) {
+        return 0U;
+    }
+
+    const size_t byte_count = size * count;
+    if (buffer->length >= buffer->capacity) {
         return 0U;
     }
 
@@ -53,7 +58,11 @@ static size_t write_to_buffer(void *contents, size_t size, size_t count, void *u
 static size_t write_to_file(void *contents, size_t size, size_t count, void *user_data)
 {
     FILE *const file = user_data;
-    return file == NULL ? 0U : fwrite(contents, size, count, file) * size;
+    if (file == NULL || contents == NULL || (count != 0U && size > SIZE_MAX / count)) {
+        return 0U;
+    }
+
+    return fwrite(contents, size, count, file) * size;
 }
 
 static bool append_header(struct curl_slist **headers, const char *value)
