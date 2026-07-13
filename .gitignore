@@ -1,0 +1,32 @@
+# Build output
+/build/
+/out/
+CMakeUserPresets.json
+
+# Supabase local state and secrets
+/supabase/.branches/
+/supabase/.temp/
+/supabase/.env
+/supabase/.env.*
+!/supabase/.env.example
+
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Native build artifacts
+*.dSYM/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+*.exe
