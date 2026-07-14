@@ -1,6 +1,7 @@
 #include "pingmote/app.h"
 
 #include "pingmote/animation.h"
+#include "pingmote/sprite.h"
 
 #include <raylib.h>
 
@@ -17,6 +18,7 @@ enum {
 
 typedef struct AppState {
     AnimationController animation;
+    SpriteSystem sprites;
     bool running;
     bool dragging;
     Vector2 drag_anchor;
@@ -78,25 +80,6 @@ static float animation_offset(const AnimationController *animation)
     return 0.0F;
 }
 
-static Color state_color(AnimationState state)
-{
-    switch (state) {
-        case ANIMATION_TALKING:
-            return (Color){255, 190, 92, 255};
-        case ANIMATION_LISTENING:
-            return (Color){113, 213, 187, 255};
-        case ANIMATION_THINKING:
-            return (Color){177, 148, 255, 255};
-        case ANIMATION_SLEEPING:
-            return (Color){115, 143, 190, 255};
-        case ANIMATION_IDLE:
-        case ANIMATION_BOUNCE:
-        case ANIMATION_STATE_COUNT:
-            return (Color){255, 219, 138, 255};
-    }
-    return (Color){255, 219, 138, 255};
-}
-
 static void update_dragging(AppState *app, Vector2 mouse)
 {
     const Rectangle drag_region = {12.0F, 10.0F, 220.0F, 32.0F};
@@ -150,28 +133,24 @@ static void update_app(AppState *app)
     animation_update(&app->animation, GetFrameTime());
 }
 
-static void draw_creature(const AnimationController *animation)
+static void draw_creature(const AppState *app)
 {
+    const AnimationController *const animation = &app->animation;
     const float offset_y = animation_offset(animation);
     const Vector2 center = {140.0F, 124.0F + offset_y};
-    const Color body = state_color(animation->state);
 
     DrawEllipse((int)center.x + 3, (int)center.y + 51, 46.0F, 9.0F, Fade(BLACK, 0.28F));
-    DrawCircleV(center, 52.0F, body);
-    DrawCircleLinesV(center, 52.0F, Fade(WHITE, 0.22F));
-
-    if (animation->state == ANIMATION_SLEEPING) {
-        DrawLineEx((Vector2){121.0F, center.y - 5.0F}, (Vector2){130.0F, center.y - 5.0F}, 3.0F, (Color){47, 42, 50, 255});
-        DrawLineEx((Vector2){150.0F, center.y - 5.0F}, (Vector2){159.0F, center.y - 5.0F}, 3.0F, (Color){47, 42, 50, 255});
+    if (sprite_system_has_state(&app->sprites, animation->state)) {
+        sprite_system_draw(
+            &app->sprites,
+            animation->state,
+            center,
+            104.0F,
+            animation->elapsed_seconds,
+            WHITE
+        );
     } else {
-        DrawCircleV((Vector2){126.0F, center.y - 6.0F}, 4.0F, (Color){47, 42, 50, 255});
-        DrawCircleV((Vector2){154.0F, center.y - 6.0F}, 4.0F, (Color){47, 42, 50, 255});
-    }
-
-    if (animation->state == ANIMATION_TALKING) {
-        DrawCircleV((Vector2){140.0F, center.y + 14.0F}, 7.0F, (Color){47, 42, 50, 255});
-    } else {
-        DrawLineEx((Vector2){134.0F, center.y + 14.0F}, (Vector2){146.0F, center.y + 14.0F}, 3.0F, (Color){47, 42, 50, 255});
+        DrawText("sprite unavailable", 78, 116, 14, (Color){225, 156, 156, 255});
     }
 }
 
@@ -192,7 +171,7 @@ static void draw_app(const AppState *app)
     DrawLine(246, 22, 254, 30, secondary_text);
     DrawLine(254, 22, 246, 30, secondary_text);
 
-    draw_creature(&app->animation);
+    draw_creature(app);
 
     const int state_width = MeasureText(state_name, 16);
     DrawText(state_name, (WINDOW_WIDTH - state_width) / 2, 188, 16, secondary_text);
@@ -219,6 +198,15 @@ int app_run(void)
     animation_init(&app.animation);
     app.running = true;
 
+    char sprite_error[160];
+    if (!sprite_system_init(
+            &app.sprites,
+            PINGMOTE_SOURCE_ASSET_DIR,
+            sprite_error,
+            sizeof(sprite_error))) {
+        TraceLog(LOG_WARNING, "SPRITE: %s", sprite_error);
+    }
+
     const char *const reduced_motion = getenv("PINGMOTE_REDUCED_MOTION");
     animation_set_reduced_motion(
         &app.animation,
@@ -232,6 +220,7 @@ int app_run(void)
         EndDrawing();
     }
 
+    sprite_system_cleanup(&app.sprites);
     CloseWindow();
     return EXIT_SUCCESS;
 }

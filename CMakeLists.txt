@@ -79,9 +79,14 @@ target_link_libraries(pingmote_core PUBLIC CURL::libcurl ${PINGMOTE_CJSON_TARGET
 add_executable(pingmote
     src/main.c
     src/app.c
+    src/sprite.c
 )
 
 target_link_libraries(pingmote PRIVATE pingmote_core raylib)
+target_compile_definitions(
+    pingmote
+    PRIVATE PINGMOTE_SOURCE_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/sprites"
+)
 
 if(APPLE)
     target_link_libraries(pingmote PRIVATE
@@ -118,3 +123,4 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS pingmote RUNTIME DESTINATION bin)
+install(DIRECTORY assets/ DESTINATION share/pingmote/assets)
