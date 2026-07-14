@@ -4,6 +4,7 @@ project(PingMote VERSION 0.1.0 LANGUAGES C)
 
 include(FetchContent)
 include(CTest)
+find_package(Threads REQUIRED)
 
 # cJSON 1.7.18 supports older CMake releases whose policy floor CMake 4 no longer assumes.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
@@ -84,15 +85,18 @@ endif()
 
 add_library(pingmote_core STATIC
     src/animation.c
+    src/assistant.c
     src/audio.c
+    src/cache.c
     src/network.c
     src/reply.c
+    src/secure_store.c
 )
 
 target_include_directories(pingmote_core PUBLIC include)
 target_link_libraries(
     pingmote_core
-    PUBLIC CURL::libcurl ${PINGMOTE_CJSON_TARGET} miniaudio
+    PUBLIC CURL::libcurl ${PINGMOTE_CJSON_TARGET} miniaudio Threads::Threads
 )
 
 add_executable(pingmote
@@ -108,6 +112,10 @@ target_compile_definitions(
 )
 
 if(APPLE)
+    target_link_libraries(pingmote_core PUBLIC
+        "-framework CoreFoundation"
+        "-framework Security"
+    )
     target_link_libraries(pingmote PRIVATE
         "-framework Cocoa"
         "-framework IOKit"
@@ -144,6 +152,11 @@ if(BUILD_TESTING)
     target_include_directories(reply_tests PRIVATE include)
     pingmote_enable_warnings(reply_tests)
     add_test(NAME reply_sanitization COMMAND reply_tests)
+
+    add_executable(cache_tests tests/cache_tests.c src/cache.c)
+    target_include_directories(cache_tests PRIVATE include)
+    pingmote_enable_warnings(cache_tests)
+    add_test(NAME cache_expiration COMMAND cache_tests)
 endif()
 
 install(TARGETS pingmote RUNTIME DESTINATION bin)
