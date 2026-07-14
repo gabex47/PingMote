@@ -15,6 +15,9 @@ typedef enum AssistantEventType {
     ASSISTANT_EVENT_READY = 0,
     ASSISTANT_EVENT_REPLY,
     ASSISTANT_EVENT_AUDIO_READY,
+    ASSISTANT_EVENT_LISTENING_STARTED,
+    ASSISTANT_EVENT_SPEECH_PREPARING,
+    ASSISTANT_EVENT_TRANSCRIPTION,
     ASSISTANT_EVENT_SETTINGS_SAVED,
     ASSISTANT_EVENT_ERROR
 } AssistantEventType;
@@ -46,6 +49,8 @@ typedef struct AssistantService {
 
 bool assistant_init(AssistantService *service, char *error, size_t error_capacity);
 bool assistant_submit_chat(AssistantService *service, const char *message);
+bool assistant_start_listening(AssistantService *service);
+bool assistant_stop_listening(AssistantService *service);
 bool assistant_save_settings(
     AssistantService *service,
     const AssistantSettingsUpdate *update

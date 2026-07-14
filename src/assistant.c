@@ -1,7 +1,10 @@
 #include "pingmote/assistant.h"
 
+#include "pingmote/microphone.h"
 #include "pingmote/network.h"
 #include "pingmote/reply.h"
+#include "pingmote/sha256.h"
+#include "pingmote/speech.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -9,17 +12,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     COMMAND_CAPACITY = 8,
     EVENT_CAPACITY = 16
 };
 
+#define WHISPER_MODEL_SIZE UINT64_C(77704715)
+
+static const char WHISPER_MODEL_URL[] =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+static const char WHISPER_MODEL_SHA256[] =
+    "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+
 typedef enum AssistantCommandType {
     COMMAND_CHAT = 0,
     COMMAND_SAVE_SETTINGS,
-    COMMAND_STOP
+    COMMAND_START_LISTENING,
+    COMMAND_STOP_LISTENING
 } AssistantCommandType;
 
 typedef struct AssistantCommand {
@@ -39,10 +52,14 @@ typedef struct AssistantImplementation {
     size_t event_read;
     size_t event_count;
     atomic_bool busy;
+    atomic_bool stopping;
+    atomic_bool network_started;
     bool thread_started;
     SecureSettings settings;
     NetworkClient network;
     CacheStore cache;
+    MicrophoneRecorder microphone;
+    SpeechRecognizer recognizer;
     bool network_ready;
     bool cache_ready;
 } AssistantImplementation;
@@ -51,6 +68,14 @@ static void set_error(char *error, size_t capacity, const char *message)
 {
     if (error != NULL && capacity > 0U) {
         (void)snprintf(error, capacity, "%s", message);
+    }
+}
+
+static void wipe_memory(void *memory, size_t size)
+{
+    volatile unsigned char *cursor = memory;
+    for (size_t index = 0U; index < size; ++index) {
+        cursor[index] = 0U;
     }
 }
 
@@ -77,6 +102,13 @@ static void push_event(AssistantImplementation *implementation, const AssistantE
 static void push_error(AssistantImplementation *implementation, const char *message)
 {
     AssistantEvent event = {.type = ASSISTANT_EVENT_ERROR};
+    (void)snprintf(event.detail, sizeof(event.detail), "%s", message);
+    push_event(implementation, &event);
+}
+
+static void push_speech_status(AssistantImplementation *implementation, const char *message)
+{
+    AssistantEvent event = {.type = ASSISTANT_EVENT_SPEECH_PREPARING};
     (void)snprintf(event.detail, sizeof(event.detail), "%s", message);
     push_event(implementation, &event);
 }
@@ -231,6 +263,7 @@ static void handle_settings(
 
     secure_settings_clear(&implementation->settings);
     implementation->settings = candidate;
+    secure_settings_clear(&candidate);
     AssistantEvent event = {
         .type = ASSISTANT_EVENT_SETTINGS_SAVED,
         .has_groq_key = implementation->settings.groq_api_key[0] != '\0',
@@ -241,6 +274,158 @@ static void handle_settings(
     push_event(implementation, &event);
 }
 
+static bool model_file_is_valid(const char *path, char *error, size_t error_capacity)
+{
+    struct stat info;
+    if (stat(path, &info) != 0 || info.st_size < 0
+        || (uint64_t)info.st_size != WHISPER_MODEL_SIZE) {
+        set_error(error, error_capacity, "speech model has an invalid size");
+        return false;
+    }
+    return sha256_file_matches(path, WHISPER_MODEL_SHA256, error, error_capacity);
+}
+
+static bool ensure_speech_recognizer(AssistantImplementation *implementation)
+{
+    if (implementation->recognizer.initialized) {
+        return true;
+    }
+    if (!implementation->cache_ready || !implementation->network_ready) {
+        push_error(implementation, "speech model is unavailable offline on first use");
+        return false;
+    }
+
+    char model_path[PINGMOTE_PATH_CAPACITY];
+    char temporary_path[PINGMOTE_PATH_CAPACITY];
+    const int model_length = snprintf(
+        model_path,
+        sizeof(model_path),
+        "%s/ggml-tiny.en.bin",
+        implementation->cache.root
+    );
+    const int temporary_length = snprintf(
+        temporary_path,
+        sizeof(temporary_path),
+        "%s/ggml-tiny.en.part",
+        implementation->cache.root
+    );
+    if (model_length < 0 || (size_t)model_length >= sizeof(model_path)
+        || temporary_length < 0 || (size_t)temporary_length >= sizeof(temporary_path)) {
+        push_error(implementation, "speech model path is too long");
+        return false;
+    }
+
+    char error[PINGMOTE_ERROR_CAPACITY];
+    bool valid_model = model_file_is_valid(model_path, error, sizeof(error));
+    if (!valid_model) {
+        (void)remove(model_path);
+        push_speech_status(implementation, "downloading speech brain once (74 mb)");
+        const NetworkStatus status = network_download_file(
+            &implementation->network,
+            WHISPER_MODEL_URL,
+            temporary_path,
+            (size_t)WHISPER_MODEL_SIZE,
+            error,
+            sizeof(error)
+        );
+        if (status != NETWORK_OK
+            || !model_file_is_valid(temporary_path, error, sizeof(error))) {
+            (void)remove(temporary_path);
+            if (!atomic_load_explicit(&implementation->stopping, memory_order_acquire)) {
+                push_error(implementation, error);
+            }
+            return false;
+        }
+        if (rename(temporary_path, model_path) != 0) {
+            (void)remove(temporary_path);
+            push_error(implementation, "failed to save speech model");
+            return false;
+        }
+        (void)chmod(model_path, 0600);
+        valid_model = true;
+    }
+
+    if (!valid_model || atomic_load_explicit(&implementation->stopping, memory_order_acquire)) {
+        return false;
+    }
+    push_speech_status(implementation, "loading tiny speech brain...");
+    if (!speech_recognizer_init(
+            &implementation->recognizer,
+            model_path,
+            error,
+            sizeof(error))) {
+        push_error(implementation, error);
+        return false;
+    }
+    return true;
+}
+
+static void handle_start_listening(AssistantImplementation *implementation)
+{
+    char error[PINGMOTE_ERROR_CAPACITY];
+    if (!implementation->microphone.initialized
+        && !microphone_init(&implementation->microphone, error, sizeof(error))) {
+        push_error(implementation, error);
+        return;
+    }
+    if (!microphone_start(&implementation->microphone, error, sizeof(error))) {
+        push_error(implementation, error);
+        return;
+    }
+    const AssistantEvent event = {.type = ASSISTANT_EVENT_LISTENING_STARTED};
+    push_event(implementation, &event);
+}
+
+static void handle_stop_listening(AssistantImplementation *implementation)
+{
+    const float *samples = NULL;
+    size_t sample_count = 0U;
+    bool truncated = false;
+    char error[PINGMOTE_ERROR_CAPACITY];
+    if (!microphone_stop(
+            &implementation->microphone,
+            &samples,
+            &sample_count,
+            &truncated,
+            error,
+            sizeof(error))) {
+        push_error(implementation, error);
+        return;
+    }
+    if (sample_count < 4800U) {
+        push_error(implementation, "hold the mic a little longer");
+        return;
+    }
+    push_speech_status(
+        implementation,
+        truncated ? "transcribing first 30 seconds..." : "transcribing..."
+    );
+    if (!ensure_speech_recognizer(implementation)) {
+        return;
+    }
+
+    char transcription[PINGMOTE_MESSAGE_CAPACITY];
+    if (!speech_transcribe(
+            &implementation->recognizer,
+            samples,
+            sample_count,
+            transcription,
+            sizeof(transcription),
+            &implementation->stopping,
+            error,
+            sizeof(error))) {
+        if (!atomic_load_explicit(&implementation->stopping, memory_order_acquire)) {
+            push_error(implementation, error);
+        }
+        return;
+    }
+
+    AssistantEvent event = {.type = ASSISTANT_EVENT_TRANSCRIPTION};
+    (void)snprintf(event.text, sizeof(event.text), "%s", transcription);
+    push_event(implementation, &event);
+    handle_chat(implementation, transcription);
+}
+
 static void *assistant_thread_main(void *user_data)
 {
     AssistantImplementation *const implementation = user_data;
@@ -249,6 +434,11 @@ static void *assistant_thread_main(void *user_data)
         &implementation->network,
         error,
         sizeof(error)
+    );
+    atomic_store_explicit(
+        &implementation->network_started,
+        implementation->network_ready,
+        memory_order_release
     );
     implementation->cache_ready = cache_init(&implementation->cache, error, sizeof(error));
     const SecureStoreStatus load_status = secure_store_load(
@@ -263,27 +453,37 @@ static void *assistant_thread_main(void *user_data)
 
     for (;;) {
         (void)pthread_mutex_lock(&implementation->mutex);
-        while (implementation->command_count == 0U) {
+        while (implementation->command_count == 0U
+            && !atomic_load_explicit(&implementation->stopping, memory_order_acquire)) {
             (void)pthread_cond_wait(&implementation->condition, &implementation->mutex);
         }
-        const AssistantCommand command = implementation->commands[implementation->command_read];
+        if (atomic_load_explicit(&implementation->stopping, memory_order_acquire)) {
+            (void)pthread_mutex_unlock(&implementation->mutex);
+            break;
+        }
+        const size_t command_index = implementation->command_read;
+        AssistantCommand command = implementation->commands[command_index];
+        wipe_memory(&implementation->commands[command_index], sizeof(AssistantCommand));
         implementation->command_read = (implementation->command_read + 1U) % COMMAND_CAPACITY;
         implementation->command_count -= 1U;
         (void)pthread_mutex_unlock(&implementation->mutex);
-
-        if (command.type == COMMAND_STOP) {
-            break;
-        }
 
         atomic_store_explicit(&implementation->busy, true, memory_order_release);
         if (command.type == COMMAND_CHAT) {
             handle_chat(implementation, command.message);
         } else if (command.type == COMMAND_SAVE_SETTINGS) {
             handle_settings(implementation, &command.settings);
+        } else if (command.type == COMMAND_START_LISTENING) {
+            handle_start_listening(implementation);
+        } else if (command.type == COMMAND_STOP_LISTENING) {
+            handle_stop_listening(implementation);
         }
         atomic_store_explicit(&implementation->busy, false, memory_order_release);
+        wipe_memory(&command, sizeof(command));
     }
 
+    microphone_cleanup(&implementation->microphone);
+    speech_recognizer_cleanup(&implementation->recognizer);
     if (implementation->network_ready) {
         network_cleanup(&implementation->network);
     }
@@ -321,6 +521,8 @@ bool assistant_init(AssistantService *service, char *error, size_t error_capacit
         return false;
     }
     atomic_init(&implementation->busy, false);
+    atomic_init(&implementation->stopping, false);
+    atomic_init(&implementation->network_started, false);
     if (pthread_mutex_init(&implementation->mutex, NULL) != 0) {
         free(implementation);
         set_error(error, error_capacity, "failed to initialize assistant synchronization");
@@ -354,6 +556,25 @@ bool assistant_submit_chat(AssistantService *service, const char *message)
     }
     AssistantCommand command = {.type = COMMAND_CHAT};
     (void)snprintf(command.message, sizeof(command.message), "%s", message);
+    return push_command(service->implementation, &command);
+}
+
+bool assistant_start_listening(AssistantService *service)
+{
+    if (service == NULL || !service->initialized || service->implementation == NULL
+        || assistant_is_busy(service)) {
+        return false;
+    }
+    const AssistantCommand command = {.type = COMMAND_START_LISTENING};
+    return push_command(service->implementation, &command);
+}
+
+bool assistant_stop_listening(AssistantService *service)
+{
+    if (service == NULL || !service->initialized || service->implementation == NULL) {
+        return false;
+    }
+    const AssistantCommand command = {.type = COMMAND_STOP_LISTENING};
     return push_command(service->implementation, &command);
 }
 
@@ -407,17 +628,20 @@ void assistant_shutdown(AssistantService *service)
         return;
     }
     AssistantImplementation *const implementation = service->implementation;
-    const AssistantCommand stop = {.type = COMMAND_STOP};
-    while (!push_command(implementation, &stop)) {
-        AssistantEvent discarded;
-        (void)assistant_poll_event(service, &discarded);
+    atomic_store_explicit(&implementation->stopping, true, memory_order_release);
+    if (atomic_load_explicit(&implementation->network_started, memory_order_acquire)) {
+        network_cancel(&implementation->network);
     }
+    (void)pthread_mutex_lock(&implementation->mutex);
+    (void)pthread_cond_broadcast(&implementation->condition);
+    (void)pthread_mutex_unlock(&implementation->mutex);
     if (implementation->thread_started) {
         (void)pthread_join(implementation->thread, NULL);
     }
     (void)pthread_cond_destroy(&implementation->condition);
     (void)pthread_mutex_destroy(&implementation->mutex);
     secure_settings_clear(&implementation->settings);
+    wipe_memory(implementation->commands, sizeof(implementation->commands));
     free(implementation);
     *service = (AssistantService){0};
 }

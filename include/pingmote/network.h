@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 typedef enum NetworkStatus {
     NETWORK_OK = 0,
@@ -17,7 +18,8 @@ typedef enum NetworkStatus {
 } NetworkStatus;
 
 typedef struct NetworkClient {
-    bool initialized;
+    atomic_bool initialized;
+    atomic_bool cancel_requested;
 } NetworkClient;
 
 bool network_init(NetworkClient *client, char *error, size_t error_capacity);
@@ -46,6 +48,7 @@ NetworkStatus network_download_file(
     size_t error_capacity
 );
 const char *network_status_name(NetworkStatus status);
+void network_cancel(NetworkClient *client);
 void network_cleanup(NetworkClient *client);
 
 #endif

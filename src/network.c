@@ -42,6 +42,28 @@ static void set_error(char *error, size_t capacity, const char *message)
     }
 }
 
+static void wipe_bytes(void *memory, size_t size)
+{
+    volatile unsigned char *cursor = memory;
+    for (size_t index = 0U; index < size; ++index) {
+        cursor[index] = 0U;
+    }
+}
+
+static void wipe_user_message(cJSON *request)
+{
+    cJSON *const messages = request == NULL
+        ? NULL
+        : cJSON_GetObjectItemCaseSensitive(request, "messages");
+    cJSON *const user = cJSON_IsArray(messages) ? cJSON_GetArrayItem(messages, 1) : NULL;
+    cJSON *const content = cJSON_IsObject(user)
+        ? cJSON_GetObjectItemCaseSensitive(user, "content")
+        : NULL;
+    if (cJSON_IsString(content) && content->valuestring != NULL) {
+        wipe_bytes(content->valuestring, strlen(content->valuestring));
+    }
+}
+
 static bool is_https_url(const char *url)
 {
     static const char prefix[] = "https://";
@@ -128,7 +150,31 @@ static NetworkStatus status_from_http(long status_code)
     return status_code >= 500L ? NETWORK_OFFLINE : NETWORK_HTTP_ERROR;
 }
 
-static bool configure_curl_common(CURL *curl, const char *url, long timeout_milliseconds)
+static int transfer_progress(
+    void *user_data,
+    curl_off_t download_total,
+    curl_off_t download_now,
+    curl_off_t upload_total,
+    curl_off_t upload_now
+)
+{
+    (void)download_total;
+    (void)download_now;
+    (void)upload_total;
+    (void)upload_now;
+    const NetworkClient *const client = user_data;
+    return client != NULL
+        && atomic_load_explicit(&client->cancel_requested, memory_order_acquire)
+        ? 1
+        : 0;
+}
+
+static bool configure_curl_common(
+    NetworkClient *client,
+    CURL *curl,
+    const char *url,
+    long timeout_milliseconds
+)
 {
     return curl_easy_setopt(curl, CURLOPT_URL, url) == CURLE_OK
         && curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L) == CURLE_OK
@@ -140,6 +186,9 @@ static bool configure_curl_common(CURL *curl, const char *url, long timeout_mill
         && curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L) == CURLE_OK
         && curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L) == CURLE_OK
         && curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L) == CURLE_OK
+        && curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L) == CURLE_OK
+        && curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transfer_progress) == CURLE_OK
+        && curl_easy_setopt(curl, CURLOPT_XFERINFODATA, client) == CURLE_OK
         && curl_easy_setopt(curl, CURLOPT_USERAGENT, "PingMote/0.2") == CURLE_OK;
 }
 
@@ -150,13 +199,14 @@ bool network_init(NetworkClient *client, char *error, size_t error_capacity)
         return false;
     }
 
-    *client = (NetworkClient){0};
+    atomic_init(&client->initialized, false);
+    atomic_init(&client->cancel_requested, false);
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         set_error(error, error_capacity, "failed to initialize libcurl");
         return false;
     }
 
-    client->initialized = true;
+    atomic_store_explicit(&client->initialized, true, memory_order_release);
     set_error(error, error_capacity, "");
     return true;
 }
@@ -182,7 +232,8 @@ NetworkStatus send_chat(
     char *request_body = NULL;
     NetworkStatus status = NETWORK_INTERNAL_ERROR;
 
-    if (client == NULL || !client->initialized
+    if (client == NULL
+        || !atomic_load_explicit(&client->initialized, memory_order_acquire)
         || groq_api_key == NULL || groq_api_key[0] == '\0'
         || message == NULL || message[0] == '\0'
         || reply == NULL || reply_capacity == 0U) {
@@ -253,7 +304,7 @@ NetworkStatus send_chat(
     if (!append_header(&headers, "Content-Type: application/json")
         || !append_header(&headers, "Accept: application/json")
         || !append_header(&headers, authorization_header)
-        || !configure_curl_common(curl, GROQ_ENDPOINT, 20000L)
+        || !configure_curl_common(client, curl, GROQ_ENDPOINT, 20000L)
         || curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers) != CURLE_OK
         || curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body) != CURLE_OK
         || curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body)) != CURLE_OK
@@ -311,13 +362,19 @@ NetworkStatus send_chat(
 
 cleanup:
     cJSON_Delete(response_json);
+    if (request_body != NULL) {
+        wipe_bytes(request_body, strlen(request_body));
+    }
     cJSON_free(request_body);
     cJSON_Delete(messages_json);
+    wipe_user_message(request_json);
     cJSON_Delete(request_json);
     curl_slist_free_all(headers);
     if (curl != NULL) {
         curl_easy_cleanup(curl);
     }
+    wipe_bytes(authorization_header, sizeof(authorization_header));
+    wipe_bytes(response_data, sizeof(response_data));
     return status;
 }
 
@@ -330,7 +387,9 @@ NetworkStatus network_download_file(
     size_t error_capacity
 )
 {
-    if (client == NULL || !client->initialized || !is_https_url(url)
+    if (client == NULL
+        || !atomic_load_explicit(&client->initialized, memory_order_acquire)
+        || !is_https_url(url)
         || output_path == NULL || output_path[0] == '\0' || maximum_bytes == 0U) {
         set_error(error, error_capacity, "valid client, HTTPS URL, output path, and size limit are required");
         return NETWORK_INVALID_ARGUMENT;
@@ -352,7 +411,7 @@ NetworkStatus network_download_file(
     }
 
     NetworkStatus status = NETWORK_INTERNAL_ERROR;
-    if (!configure_curl_common(curl, url, 120000L)
+    if (!configure_curl_common(client, curl, url, 300000L)
         || curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_file) != CURLE_OK
         || curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink) != CURLE_OK) {
         set_error(error, error_capacity, "failed to configure download transport");
@@ -499,9 +558,17 @@ const char *network_status_name(NetworkStatus status)
 
 void network_cleanup(NetworkClient *client)
 {
-    if (client == NULL || !client->initialized) {
+    if (client == NULL
+        || !atomic_load_explicit(&client->initialized, memory_order_acquire)) {
         return;
     }
     curl_global_cleanup();
-    client->initialized = false;
+    atomic_store_explicit(&client->initialized, false, memory_order_release);
+}
+
+void network_cancel(NetworkClient *client)
+{
+    if (client != NULL) {
+        atomic_store_explicit(&client->cancel_requested, true, memory_order_release);
+    }
 }

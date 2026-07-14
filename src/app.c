@@ -3,6 +3,7 @@
 #include "pingmote/animation.h"
 #include "pingmote/assistant.h"
 #include "pingmote/audio.h"
+#include "pingmote/resources.h"
 #include "pingmote/sprite.h"
 
 #include <raylib.h>
@@ -17,12 +18,13 @@ enum {
     WINDOW_WIDTH = 360,
     WINDOW_HEIGHT = 370,
     TARGET_FPS = 60,
-    MAIN_FOCUS_COUNT = 3,
+    MAIN_FOCUS_COUNT = 4,
     SETTINGS_FOCUS_COUNT = 5
 };
 
 typedef enum MainFocus {
     MAIN_FOCUS_MESSAGE = 0,
+    MAIN_FOCUS_MICROPHONE,
     MAIN_FOCUS_SEND,
     MAIN_FOCUS_SETTINGS
 } MainFocus;
@@ -51,6 +53,11 @@ typedef struct AppState {
     bool dragging;
     bool settings_open;
     bool assistant_ready;
+    bool listening;
+    bool listen_start_pending;
+    bool push_to_talk_active;
+    bool push_to_talk_mouse;
+    bool response_pending;
     bool secure_storage_available;
     bool has_groq_key;
     bool has_supabase_url;
@@ -102,6 +109,24 @@ static void set_notice(AppState *app, const char *message, float seconds)
 {
     (void)snprintf(app->notice, sizeof(app->notice), "%s", message == NULL ? "" : message);
     app->notice_seconds = seconds;
+}
+
+static void wipe_bytes(void *memory, size_t size)
+{
+    volatile unsigned char *cursor = memory;
+    for (size_t index = 0U; index < size; ++index) {
+        cursor[index] = 0U;
+    }
+}
+
+static void clear_settings_fields(AppState *app)
+{
+    wipe_bytes(app->groq_key, sizeof(app->groq_key));
+    wipe_bytes(app->supabase_url, sizeof(app->supabase_url));
+    wipe_bytes(app->supabase_key, sizeof(app->supabase_key));
+    app->groq_touched = false;
+    app->supabase_url_touched = false;
+    app->supabase_key_touched = false;
 }
 
 static float animation_offset(const AnimationController *animation)
@@ -198,9 +223,9 @@ static void update_text_field(TextField *field)
 
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
         const size_t length = strlen(field->text);
+        field->touched = true;
         if (length > 0U) {
             field->text[utf8_previous(field->text, length)] = '\0';
-            field->touched = true;
         }
     }
 
@@ -221,17 +246,48 @@ static void open_settings(AppState *app)
 {
     app->settings_open = true;
     app->settings_focus = SETTINGS_FOCUS_GROQ;
-    app->groq_key[0] = '\0';
-    app->supabase_url[0] = '\0';
-    app->supabase_key[0] = '\0';
-    app->groq_touched = false;
-    app->supabase_url_touched = false;
-    app->supabase_key_touched = false;
+    clear_settings_fields(app);
+}
+
+static void stop_listening(AppState *app)
+{
+    app->push_to_talk_active = false;
+    if (!app->listening) {
+        return;
+    }
+    app->listening = false;
+    app->response_pending = true;
+    if (!assistant_stop_listening(&app->assistant)) {
+        app->response_pending = false;
+        set_notice(app, "could not stop microphone", 5.0F);
+        (void)animation_set_state(&app->animation, ANIMATION_IDLE);
+        return;
+    }
+    set_bubble(app, "turning noises into words...", 30.0F);
+    (void)animation_set_state(&app->animation, ANIMATION_THINKING);
+}
+
+static void start_listening(AppState *app, bool from_mouse)
+{
+    if (app->listening || app->listen_start_pending || app->response_pending
+        || assistant_is_busy(&app->assistant)) {
+        return;
+    }
+    if (!assistant_start_listening(&app->assistant)) {
+        set_notice(app, "microphone is busy", 4.0F);
+        return;
+    }
+    app->listen_start_pending = true;
+    app->push_to_talk_active = true;
+    app->push_to_talk_mouse = from_mouse;
+    set_bubble(app, "opening an ear...", 10.0F);
+    (void)animation_set_state(&app->animation, ANIMATION_THINKING);
 }
 
 static void submit_message(AppState *app)
 {
-    if (app->message[0] == '\0' || assistant_is_busy(&app->assistant)) {
+    if (app->message[0] == '\0' || assistant_is_busy(&app->assistant)
+        || app->listening || app->listen_start_pending || app->response_pending) {
         return;
     }
     if (!assistant_submit_chat(&app->assistant, app->message)) {
@@ -239,6 +295,7 @@ static void submit_message(AppState *app)
         return;
     }
     app->message[0] = '\0';
+    app->response_pending = true;
     set_bubble(app, "hmm...", 20.0F);
     (void)animation_set_state(&app->animation, ANIMATION_THINKING);
 }
@@ -261,7 +318,9 @@ static void save_settings(AppState *app)
     (void)snprintf(editable.groq_api_key, sizeof(editable.groq_api_key), "%s", app->groq_key);
     (void)snprintf(editable.supabase_url, sizeof(editable.supabase_url), "%s", app->supabase_url);
     (void)snprintf(editable.supabase_key, sizeof(editable.supabase_key), "%s", app->supabase_key);
-    if (!assistant_save_settings(&app->assistant, &editable)) {
+    const bool queued = assistant_save_settings(&app->assistant, &editable);
+    wipe_bytes(&editable, sizeof(editable));
+    if (!queued) {
         set_notice(app, "could not queue settings save", 5.0F);
     } else {
         set_notice(app, "saving securely...", 10.0F);
@@ -309,6 +368,7 @@ static void update_settings(AppState *app)
     if (activate_rectangle(cancel_bounds)
         || IsKeyPressed(KEY_ESCAPE)
         || (app->settings_focus == SETTINGS_FOCUS_CANCEL && IsKeyPressed(KEY_ENTER))) {
+        clear_settings_fields(app);
         app->settings_open = false;
     } else if (activate_rectangle(save_bounds)
         || (app->settings_focus == SETTINGS_FOCUS_SAVE && IsKeyPressed(KEY_ENTER))) {
@@ -334,6 +394,7 @@ static void process_assistant_events(AppState *app)
                 }
                 break;
             case ASSISTANT_EVENT_REPLY:
+                app->response_pending = false;
                 set_bubble(app, event.text, 8.0F);
                 break;
             case ASSISTANT_EVENT_AUDIO_READY: {
@@ -350,15 +411,40 @@ static void process_assistant_events(AppState *app)
                 }
                 break;
             }
+            case ASSISTANT_EVENT_LISTENING_STARTED:
+                app->listen_start_pending = false;
+                app->listening = true;
+                if (!app->push_to_talk_active) {
+                    stop_listening(app);
+                } else {
+                    set_bubble(app, "listening...", 35.0F);
+                    (void)animation_set_state(&app->animation, ANIMATION_LISTENING);
+                }
+                break;
+            case ASSISTANT_EVENT_SPEECH_PREPARING:
+                app->listening = false;
+                app->listen_start_pending = false;
+                app->response_pending = true;
+                set_bubble(app, event.detail, 30.0F);
+                (void)animation_set_state(&app->animation, ANIMATION_THINKING);
+                break;
+            case ASSISTANT_EVENT_TRANSCRIPTION:
+                set_notice(app, event.text, 4.0F);
+                break;
             case ASSISTANT_EVENT_SETTINGS_SAVED:
                 app->has_groq_key = event.has_groq_key;
                 app->has_supabase_url = event.has_supabase_url;
                 app->has_supabase_key = event.has_supabase_key;
+                clear_settings_fields(app);
                 app->settings_open = false;
                 set_bubble(app, "locked in boss", 5.0F);
                 set_notice(app, "settings saved in Keychain", 4.0F);
                 break;
             case ASSISTANT_EVENT_ERROR:
+                app->listening = false;
+                app->listen_start_pending = false;
+                app->push_to_talk_active = false;
+                app->response_pending = false;
                 set_notice(app, event.detail, 6.0F);
                 if (app->animation.state == ANIMATION_THINKING) {
                     (void)animation_set_state(&app->animation, ANIMATION_IDLE);
@@ -380,7 +466,8 @@ static void audio_finished(void *user_data, const char *path, bool completed)
 
 static void update_main(AppState *app)
 {
-    const Rectangle message_bounds = {18.0F, 302.0F, 244.0F, 44.0F};
+    const Rectangle message_bounds = {18.0F, 302.0F, 194.0F, 44.0F};
+    const Rectangle microphone_bounds = {220.0F, 302.0F, 42.0F, 44.0F};
     const Rectangle send_bounds = {270.0F, 302.0F, 72.0F, 44.0F};
     const Rectangle settings_bounds = {286.0F, 10.0F, 28.0F, 32.0F};
     const Vector2 mouse = GetMousePosition();
@@ -388,6 +475,9 @@ static void update_main(AppState *app)
 
     if (activate_rectangle(message_bounds)) {
         app->main_focus = MAIN_FOCUS_MESSAGE;
+    } else if (activate_rectangle(microphone_bounds)) {
+        app->main_focus = MAIN_FOCUS_MICROPHONE;
+        start_listening(app, true);
     } else if (activate_rectangle(send_bounds)) {
         app->main_focus = MAIN_FOCUS_SEND;
         submit_message(app);
@@ -408,10 +498,18 @@ static void update_main(AppState *app)
         if (IsKeyPressed(KEY_ENTER)) {
             submit_message(app);
         }
+    } else if (app->main_focus == MAIN_FOCUS_MICROPHONE && IsKeyPressed(KEY_ENTER)) {
+        start_listening(app, false);
     } else if (app->main_focus == MAIN_FOCUS_SEND && IsKeyPressed(KEY_ENTER)) {
         submit_message(app);
     } else if (app->main_focus == MAIN_FOCUS_SETTINGS && IsKeyPressed(KEY_ENTER)) {
         open_settings(app);
+    }
+
+    if (app->push_to_talk_active
+        && ((app->push_to_talk_mouse && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+            || (!app->push_to_talk_mouse && IsKeyReleased(KEY_ENTER)))) {
+        stop_listening(app);
     }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
@@ -451,7 +549,9 @@ static void update_app(AppState *app)
         app->notice_seconds -= delta;
     }
     if (app->animation.state == ANIMATION_THINKING
-        && !assistant_is_busy(&app->assistant)) {
+        && !assistant_is_busy(&app->assistant)
+        && !app->listen_start_pending
+        && !app->response_pending) {
         (void)animation_set_state(&app->animation, ANIMATION_IDLE);
     }
     animation_update(&app->animation, delta);
@@ -602,7 +702,8 @@ static void draw_header(void)
 
 static void draw_main(const AppState *app)
 {
-    const Rectangle message_bounds = {18.0F, 302.0F, 244.0F, 44.0F};
+    const Rectangle message_bounds = {18.0F, 302.0F, 194.0F, 44.0F};
+    const Rectangle microphone_bounds = {220.0F, 302.0F, 42.0F, 44.0F};
     const Rectangle send_bounds = {270.0F, 302.0F, 72.0F, 44.0F};
     const TextField message = {
         (char *)app->message,
@@ -619,10 +720,18 @@ static void draw_main(const AppState *app)
         app->main_focus == MAIN_FOCUS_MESSAGE
     );
     draw_button(
+        microphone_bounds,
+        app->listening ? "live" : "mic",
+        app->main_focus == MAIN_FOCUS_MICROPHONE || app->listening,
+        !app->response_pending && !app->listen_start_pending
+            && (!assistant_is_busy(&app->assistant) || app->listening)
+    );
+    draw_button(
         send_bounds,
         assistant_is_busy(&app->assistant) ? "wait" : "send",
         app->main_focus == MAIN_FOCUS_SEND,
         app->message[0] != '\0' && !assistant_is_busy(&app->assistant)
+            && !app->listening && !app->response_pending
     );
 }
 
@@ -637,7 +746,7 @@ static void draw_settings(const AppState *app)
     draw_text_field(
         (Rectangle){30.0F, 101.0F, 300.0F, 39.0F},
         &groq,
-        app->has_groq_key ? "saved securely - type to replace" : "gsk_...",
+        app->has_groq_key ? "saved - type replaces, backspace clears" : "gsk_...",
         app->settings_focus == SETTINGS_FOCUS_GROQ
     );
 
@@ -646,7 +755,7 @@ static void draw_settings(const AppState *app)
     draw_text_field(
         (Rectangle){30.0F, 171.0F, 300.0F, 39.0F},
         &url,
-        app->has_supabase_url ? "saved securely - type to replace" : "https://project.supabase.co",
+        app->has_supabase_url ? "saved - type replaces, backspace clears" : "https://project.supabase.co",
         app->settings_focus == SETTINGS_FOCUS_SUPABASE_URL
     );
 
@@ -655,7 +764,7 @@ static void draw_settings(const AppState *app)
     draw_text_field(
         (Rectangle){30.0F, 241.0F, 300.0F, 39.0F},
         &key,
-        app->has_supabase_key ? "saved securely - type to replace" : "public client key",
+        app->has_supabase_key ? "saved - type replaces, backspace clears" : "public client key",
         app->settings_focus == SETTINGS_FOCUS_SUPABASE_KEY
     );
 
@@ -728,9 +837,21 @@ int app_run(void)
     app.main_focus = MAIN_FOCUS_MESSAGE;
 
     char error[PINGMOTE_ERROR_CAPACITY];
+    char sprite_directory[PINGMOTE_PATH_CAPACITY];
+    if (!resource_find_sprite_directory(
+            PINGMOTE_SOURCE_ASSET_DIR,
+            sprite_directory,
+            sizeof(sprite_directory))) {
+        (void)snprintf(
+            sprite_directory,
+            sizeof(sprite_directory),
+            "%s",
+            PINGMOTE_SOURCE_ASSET_DIR
+        );
+    }
     if (!sprite_system_init(
             &app.sprites,
-            PINGMOTE_SOURCE_ASSET_DIR,
+            sprite_directory,
             error,
             sizeof(error))) {
         TraceLog(LOG_WARNING, "SPRITE: %s", error);
@@ -760,6 +881,7 @@ int app_run(void)
     }
 
     assistant_shutdown(&app.assistant);
+    clear_settings_fields(&app);
     sprite_system_cleanup(&app.sprites);
     cleanup_audio(&app.audio);
     CloseWindow();

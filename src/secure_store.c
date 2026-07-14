@@ -17,6 +17,31 @@ static void set_error(char *error, size_t capacity, const char *message)
     }
 }
 
+static void wipe_bytes(void *memory, size_t size)
+{
+    volatile unsigned char *cursor = memory;
+    for (size_t index = 0U; index < size; ++index) {
+        cursor[index] = 0U;
+    }
+}
+
+static void wipe_json_settings(cJSON *object)
+{
+    static const char *const names[] = {
+        "groq_api_key",
+        "supabase_url",
+        "supabase_key"
+    };
+    for (size_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
+        cJSON *const item = object == NULL
+            ? NULL
+            : cJSON_GetObjectItemCaseSensitive(object, names[index]);
+        if (cJSON_IsString(item) && item->valuestring != NULL) {
+            wipe_bytes(item->valuestring, strlen(item->valuestring));
+        }
+    }
+}
+
 void secure_settings_clear(SecureSettings *settings)
 {
     if (settings == NULL) {
@@ -146,6 +171,7 @@ SecureStoreStatus secure_store_load(
     CFRelease(result);
 
     cJSON *const object = cJSON_ParseWithLength(json, (size_t)length);
+    wipe_bytes(json, sizeof(json));
     const cJSON *const groq = object == NULL ? NULL
         : cJSON_GetObjectItemCaseSensitive(object, "groq_api_key");
     const cJSON *const url = object == NULL ? NULL
@@ -163,6 +189,7 @@ SecureStoreStatus secure_store_load(
         (void)snprintf(settings->supabase_url, sizeof(settings->supabase_url), "%s", url->valuestring);
         (void)snprintf(settings->supabase_key, sizeof(settings->supabase_key), "%s", key->valuestring);
     }
+    wipe_json_settings(object);
     cJSON_Delete(object);
     if (!valid) {
         secure_settings_clear(settings);
@@ -190,23 +217,27 @@ SecureStoreStatus secure_store_save(
         || cJSON_AddStringToObject(object, "groq_api_key", settings->groq_api_key) == NULL
         || cJSON_AddStringToObject(object, "supabase_url", settings->supabase_url) == NULL
         || cJSON_AddStringToObject(object, "supabase_key", settings->supabase_key) == NULL) {
+        wipe_json_settings(object);
         cJSON_Delete(object);
         set_error(error, error_capacity, "failed to prepare credentials");
         return SECURE_STORE_ERROR;
     }
 
     char *const json = cJSON_PrintUnformatted(object);
+    wipe_json_settings(object);
     cJSON_Delete(object);
     if (json == NULL) {
         set_error(error, error_capacity, "failed to prepare credentials");
         return SECURE_STORE_ERROR;
     }
 
+    const size_t json_length = strlen(json);
     CFDataRef data = CFDataCreate(
         kCFAllocatorDefault,
         (const UInt8 *)json,
-        (CFIndex)strlen(json)
+        (CFIndex)json_length
     );
+    wipe_bytes(json, json_length);
     cJSON_free(json);
     CFMutableDictionaryRef query = create_query();
     if (data == NULL || query == NULL) {
