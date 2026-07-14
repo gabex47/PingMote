@@ -1,82 +1,116 @@
 # PingMote
 
-PingMote is a tiny native desktop creature. It stays out of the way, responds in a few words, and uses motion instead of conversation chrome to feel alive.
+PingMote is a tiny native desktop creature written in C23. It stays above other windows, answers in a few words, speaks with a deliberately crusty SAPI4 voice, and uses animation instead of chatbot chrome.
 
-## Status
+## What works
 
-This repository contains the production-oriented foundation:
+- transparent, borderless, always-on-top macOS app at 60 FPS
+- supplied Idle, Talking, and Thinking PNGs with cached sprite-sheet-ready loading
+- compact text input, Enter-to-send, fading speech bubble, and keyboard navigation
+- direct Groq chat with `llama-3.1-8b-instant` and locally enforced short plain-text replies
+- Tetyys `Mike (for Telephone)` speech, asynchronous miniaudio playback, and expiring audio reuse
+- hold-to-talk microphone capture and local whisper.cpp transcription
+- macOS Keychain storage for the Groq key and optional Supabase configuration
+- seven-day prompt/reply and generated-audio cache
+- built-in offline replies; animation, input, and voice recording remain available without a network
+- one background worker for network, Keychain, cache, model loading, and transcription work
 
-- C23 desktop application built with CMake and raylib
-- transparent, borderless, always-on-top, draggable 60 FPS window
-- allocation-free animation state machine with six states
-- isolated audio and HTTPS networking modules
-- authenticated Supabase Edge Function client
-- Supabase migrations with per-user Row Level Security
-- a JWT-protected `chat` Edge Function with strict short-reply enforcement
+Conversation history is never stored. Cached prompts and replies expire automatically and credentials never enter the cache.
 
-The creature currently uses a lightweight procedural renderer. Sprite and sound assets can be added without changing application or state-management code.
-
-## Prerequisites
+## Requirements
 
 - macOS 13 or newer
 - Xcode Command Line Tools
 - CMake 3.24 or newer
-- libcurl development files (included with macOS; Homebrew curl also works)
+- Ninja
+- libcurl development files (the macOS or Homebrew installation works)
+- an internet connection during the first configure, unless all dependencies are already available locally
 
-raylib and cJSON are discovered locally first. If unavailable, CMake fetches pinned releases during configuration.
+CMake uses pinned, SHA-256-verified releases of raylib 5.5, cJSON 1.7.18, miniaudio 0.11.25, and whisper.cpp 1.8.6.
 
-## Build
+## Build and run
 
 ```sh
 cmake --preset dev
 cmake --build --preset dev
 ctest --preset dev
-./build/dev/pingmote
+open build/dev/PingMote.app
 ```
 
-For a release build:
+For terminal logs, run the bundle executable directly:
+
+```sh
+./build/dev/PingMote.app/Contents/MacOS/PingMote
+```
+
+Release build:
 
 ```sh
 cmake --preset release
 cmake --build --preset release
+open build/release/PingMote.app
 ```
+
+## First launch
+
+1. Open **settings** in PingMote.
+2. Paste a Groq API key and choose **save securely**.
+3. Hold the **mic** button to speak, or type a message and press Enter.
+4. Approve the macOS microphone prompt when using push-to-talk for the first time.
+
+The first transcription downloads the pinned 74 MB `tiny.en` whisper model, verifies its SHA-256 digest, and keeps it in the user cache. Later transcriptions are local and do not upload microphone audio.
 
 ## Controls
 
-- Drag the top bar to move Mote.
-- Press `1`–`6` to select Idle, Talking, Listening, Thinking, Sleeping, or Bounce.
+- Drag the header to move PingMote.
 - Click Mote to bounce.
-- Press `M` to toggle reduced motion.
-- Press `Q` or click the close button to quit.
+- Type and press Enter to send.
+- Hold **mic** with the pointer, or Tab to it and hold Enter, for push-to-talk.
+- Use Tab and Shift-Tab to navigate controls.
+- Click **settings** to replace or clear saved credentials.
+- Press Command-Q or click the close button to quit.
+- Set `PINGMOTE_REDUCED_MOTION=1` before launch to disable idle movement.
 
-## Backend configuration
+## Local data
 
-The desktop client never contains provider secrets. Supply public project configuration and the signed-in user's short-lived access token at runtime:
+On macOS, non-secret cache files live under:
 
-```sh
-export PINGMOTE_SUPABASE_URL="https://fclgpxemiseqozwwhktd.supabase.co"
-export PINGMOTE_SUPABASE_PUBLISHABLE_KEY="sb_publishable_..."
-export PINGMOTE_ACCESS_TOKEN="user-jwt"
+```text
+~/Library/Caches/com.pingmote.desktop/
 ```
 
-`PINGMOTE_SUPABASE_PUBLISHABLE_KEY` is a client-safe project identifier, not an LLM secret. The language-model key exists only as the Edge Function secret `OPENAI_API_KEY`. See [docs/backend.md](docs/backend.md) for deployment and secret configuration.
+Prompt/reply and TTS entries expire after seven days. Partial downloads are removed after failure or startup cleanup. The whisper model remains cached until the user removes it. Groq and optional Supabase credentials are stored only in macOS Keychain.
+
+## Optional live tests
+
+Unit tests never require a network or microphone. Maintainers can explicitly enable live provider tests:
+
+```sh
+cmake -S . -B build/live -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DPINGMOTE_NETWORK_TESTS=ON
+cmake --build build/live
+ctest --test-dir build/live -L network --output-on-failure
+```
+
+The live tests download a short Tetyys sample, play and remove it, and verify whisper against its official sample. They do not exercise Groq because no API key is read by the test process.
 
 ## Project layout
 
 ```text
-assets/                  Sprite and audio asset contracts
+assets/                  Bundled sprite and audio assets
+cmake/                   macOS bundle metadata
 docs/                    Architecture and backend operations
 include/pingmote/         Public C module interfaces
 src/                     Native application implementation
-supabase/functions/chat/ Edge Function source
+supabase/functions/chat/ Optional hosted Edge Function
 supabase/migrations/     Applied database migrations
-tests/                   Fast native unit tests
-third_party/             Third-party integration notes
+tests/                   Unit and opt-in live smoke tests
+third_party/             Dependency policy
 ```
 
-## Architecture
-
-The window/application layer owns raylib. Animation state, audio, and networking remain isolated behind small C APIs, so whisper.cpp, miniaudio playback, caching, and OS-specific integrations can be introduced without coupling them to rendering. Network requests use fixed-size response buffers and HTTPS-only libcurl settings; credentials are read at runtime and are never logged.
+The optional Supabase backend remains available for future accounts and synced memories. Phase 2 chat calls the user’s Groq account directly; neither Groq nor microphone audio passes through Supabase.
 
 ## License
 

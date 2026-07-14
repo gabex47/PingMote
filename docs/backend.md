@@ -1,4 +1,6 @@
-# Backend operations
+# Optional Supabase backend operations
+
+The Phase 2 desktop app calls the user's Groq account directly and does not require Supabase to chat. This backend remains deployed for future accounts, settings sync, explicit memories, and an optional hosted chat path.
 
 ## Project
 

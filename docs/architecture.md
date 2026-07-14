@@ -1,36 +1,50 @@
 # Architecture
 
-## Native process
+## Runtime boundaries
 
-`app` owns the window lifecycle and all raylib calls. `animation` is a deterministic, allocation-free state machine with no graphics dependency. `network` owns libcurl and cJSON, validates all inputs, allows HTTPS only, and writes into caller-provided fixed buffers. `audio` defines the stable playback boundary while the initial build remains silent.
+`app` owns the raylib window and is the only layer that draws or reads UI input. Its frame loop performs bounded memory operations, polls worker events, updates animation/audio state, and renders at 60 FPS.
 
-This separation keeps platform work local: future Windows and Linux window adapters can replace `app.c`; miniaudio can replace the audio internals; and whisper.cpp can publish transcription events without changing rendering.
-
-## State and event flow
+`assistant` owns one background worker and fixed-capacity command/event rings. The worker performs all potentially blocking HTTP, Keychain, cache, model, and transcription operations. Shutdown publishes a cancellation flag to libcurl and whisper before joining the worker.
 
 ```text
-input / future speech / network
-              |
-              v
-      AnimationState enum
-              |
-              v
-      renderer or sprite pack
+text / push-to-talk
+        |
+        v
+fixed command ring ----> assistant worker
+                             |  |  |
+                       Groq/TTS cache/whisper
+                             |  |  |
+        renderer <----- fixed event ring
+            |
+            v
+ animation enum + async miniaudio playback
 ```
 
-Transitions reset elapsed state time. Bounce is transient and returns to the state that preceded it. A reduced-motion mode preserves state changes while removing movement.
+No subsystem calls raylib from another thread. miniaudio callbacks only copy capture samples or set an atomic completion flag; resource destruction and application callbacks happen on their owning thread.
 
-## Backend boundary
+## Modules
 
-The desktop app calls only the authenticated Supabase `chat` Edge Function. The gateway verifies the user's JWT before the function runs. Provider credentials are stored exclusively as Supabase secrets, and the response is validated again by the native client.
+- `animation`: deterministic allocation-free state machine.
+- `sprite`: one-load texture cache, per-state fallback mapping, frame timing, and horizontal sprite-sheet support.
+- `audio`: asynchronous decoded playback and render-thread completion dispatch.
+- `microphone`: bounded 16 kHz mono capture buffer with a 30-second ceiling.
+- `speech`: whisper.cpp model lifecycle and local transcription.
+- `network`: HTTPS-only libcurl transport, bounded responses/downloads, cancellation, Groq JSON, and Tetyys WAV validation.
+- `reply`: markdown/emoji stripping, lowercase normalization, hard word limit, and offline phrases.
+- `cache`: collision-checked prompt entries, TTS reuse, private permissions, atomic writes, and seven-day pruning.
+- `secure_store`: macOS Keychain access with explicit failure when secure storage is unavailable.
+- `resources`: bundle-first sprite discovery with a source-tree development fallback.
 
-Conversations are not persisted. The database contains only user profiles, preferences, and explicitly selected memories protected by Row Level Security.
+## Data and credentials
+
+Groq and optional Supabase values are stored as one Keychain generic-password item. Keychain calls run on the worker. Temporary UI and queue copies are overwritten after use. Keys are never logged, cached, embedded, or sent anywhere except their configured provider.
+
+Prompt/reply caches contain no credentials but may contain user text, so their directory is mode `0700` and files are mode `0600`. Conversation history is not persisted. TTS cache artifacts are retained only for reuse and expire automatically.
+
+## Speech path
+
+Push-to-talk initializes and starts miniaudio capture on the worker. Release stops the device before transcription reads the stable preallocated sample buffer. First use downloads `ggml-tiny.en.bin` from whisper.cpp’s official model repository, enforces the exact byte limit, verifies a pinned SHA-256 digest, and atomically renames the partial file. Inference uses Metal/Accelerate on Apple Silicon with a CPU backend available to whisper.cpp.
 
 ## Extension points
 
-- Sprite packs: add an asset loader and renderer behind the current draw function.
-- Voice: implement the existing audio boundary with miniaudio; keep synthesis server-side or in an isolated adapter.
-- Transcription: add a whisper.cpp worker that emits text events to the app loop.
-- Offline mode: add a local response provider behind the same chat request boundary.
-- Cache: use the OS application-data directory and bounded LRU metadata.
-- Personalities and idle behaviors: drive the existing animation enum through configuration and timed events.
+The command/event boundary accommodates later transcription engines, offline response providers, personality profiles, and memory decisions without changing rendering. Animation states already decouple behavior from available art, and the resource loader accepts future horizontal sprite sheets. Platform credential and bundle adapters are isolated for future Windows and Linux implementations.
