@@ -1,5 +1,5 @@
 # Third-party dependencies
 
-Dependencies are intentionally not vendored in Git. CMake first uses compatible system packages and otherwise fetches pinned raylib and cJSON release tags. libcurl comes from the platform package manager.
+Dependencies are intentionally not vendored in Git. CMake first uses compatible system packages and otherwise fetches pinned, SHA-256-verified raylib, cJSON, and miniaudio release archives. libcurl comes from the platform package manager.
 
-miniaudio and whisper.cpp will be integrated behind the existing audio and future transcription boundaries when those features are implemented.
+whisper.cpp is integrated separately behind the transcription boundary so its model lifecycle never leaks into rendering or audio playback code.

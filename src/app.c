@@ -1,6 +1,7 @@
 #include "pingmote/app.h"
 
 #include "pingmote/animation.h"
+#include "pingmote/audio.h"
 #include "pingmote/sprite.h"
 
 #include <raylib.h>
@@ -18,6 +19,7 @@ enum {
 
 typedef struct AppState {
     AnimationController animation;
+    AudioManager audio;
     SpriteSystem sprites;
     bool running;
     bool dragging;
@@ -131,6 +133,7 @@ static void update_app(AppState *app)
     }
 
     animation_update(&app->animation, GetFrameTime());
+    audio_update(&app->audio);
 }
 
 static void draw_creature(const AppState *app)
@@ -207,6 +210,11 @@ int app_run(void)
         TraceLog(LOG_WARNING, "SPRITE: %s", sprite_error);
     }
 
+    char audio_error[160];
+    if (!audio_init(&app.audio, audio_error, sizeof(audio_error))) {
+        TraceLog(LOG_WARNING, "AUDIO: %s", audio_error);
+    }
+
     const char *const reduced_motion = getenv("PINGMOTE_REDUCED_MOTION");
     animation_set_reduced_motion(
         &app.animation,
@@ -221,6 +229,7 @@ int app_run(void)
     }
 
     sprite_system_cleanup(&app.sprites);
+    cleanup_audio(&app.audio);
     CloseWindow();
     return EXIT_SUCCESS;
 }

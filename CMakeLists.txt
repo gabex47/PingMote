@@ -17,6 +17,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(CURL 8.0 REQUIRED)
 
+set(MINIAUDIO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(MINIAUDIO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MINIAUDIO_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(MINIAUDIO_INSTALL OFF CACHE BOOL "" FORCE)
+set(MINIAUDIO_NO_EXTRA_NODES ON CACHE BOOL "" FORCE)
+set(MINIAUDIO_NO_LIBOPUS ON CACHE BOOL "" FORCE)
+set(MINIAUDIO_NO_LIBVORBIS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    miniaudio
+    URL https://github.com/mackron/miniaudio/archive/refs/tags/0.11.25.tar.gz
+    URL_HASH SHA256=b900edcffe979816e2560a0580b9b1216d674b4f17fbadeca8f777a7f8ab0274
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+)
+FetchContent_MakeAvailable(miniaudio)
+
 find_package(raylib 5.5 QUIET)
 if(NOT TARGET raylib)
     if(NOT PINGMOTE_FETCH_DEPENDENCIES)
@@ -74,7 +89,10 @@ add_library(pingmote_core STATIC
 )
 
 target_include_directories(pingmote_core PUBLIC include)
-target_link_libraries(pingmote_core PUBLIC CURL::libcurl ${PINGMOTE_CJSON_TARGET})
+target_link_libraries(
+    pingmote_core
+    PUBLIC CURL::libcurl ${PINGMOTE_CJSON_TARGET} miniaudio
+)
 
 add_executable(pingmote
     src/main.c
