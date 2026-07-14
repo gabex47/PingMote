@@ -86,6 +86,7 @@ add_library(pingmote_core STATIC
     src/animation.c
     src/audio.c
     src/network.c
+    src/reply.c
 )
 
 target_include_directories(pingmote_core PUBLIC include)
@@ -138,6 +139,11 @@ if(BUILD_TESTING)
     target_include_directories(animation_tests PRIVATE include)
     pingmote_enable_warnings(animation_tests)
     add_test(NAME animation_state_machine COMMAND animation_tests)
+
+    add_executable(reply_tests tests/reply_tests.c src/reply.c)
+    target_include_directories(reply_tests PRIVATE include)
+    pingmote_enable_warnings(reply_tests)
+    add_test(NAME reply_sanitization COMMAND reply_tests)
 endif()
 
 install(TARGETS pingmote RUNTIME DESTINATION bin)
