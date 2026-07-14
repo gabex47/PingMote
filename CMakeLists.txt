@@ -12,6 +12,34 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 option(PINGMOTE_FETCH_DEPENDENCIES "Fetch missing third-party dependencies" ON)
 option(PINGMOTE_NETWORK_TESTS "Enable live network smoke tests" OFF)
 
+# Vendored dependencies are implementation details and must not leak into the
+# PingMote install component. FetchContent gained native support for this in
+# CMake 3.28; keep an equivalent path for the project's CMake 3.24 minimum.
+set(PINGMOTE_FETCH_EXCLUDE_FROM_ALL)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+    set(PINGMOTE_FETCH_EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+endif()
+
+function(pingmote_make_dependency_available dependency)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+        FetchContent_MakeAvailable(${dependency})
+    else()
+        FetchContent_GetProperties(${dependency})
+        if(NOT ${dependency}_POPULATED)
+            FetchContent_Populate(${dependency})
+            add_subdirectory(
+                "${${dependency}_SOURCE_DIR}"
+                "${${dependency}_BINARY_DIR}"
+                EXCLUDE_FROM_ALL
+            )
+        endif()
+    endif()
+
+    FetchContent_GetProperties(${dependency})
+    set(${dependency}_SOURCE_DIR "${${dependency}_SOURCE_DIR}" PARENT_SCOPE)
+    set(${dependency}_BINARY_DIR "${${dependency}_BINARY_DIR}" PARENT_SCOPE)
+endfunction()
+
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -36,8 +64,9 @@ FetchContent_Declare(
     URL https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.8.6.tar.gz
     URL_HASH SHA256=f8e632016ceae556f3132a16c7f704be1e7715595041f474fa81a2b64c1abf7c
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    ${PINGMOTE_FETCH_EXCLUDE_FROM_ALL}
 )
-FetchContent_MakeAvailable(whisper)
+pingmote_make_dependency_available(whisper)
 
 find_package(CURL 8.0 REQUIRED)
 
@@ -53,8 +82,9 @@ FetchContent_Declare(
     URL https://github.com/mackron/miniaudio/archive/refs/tags/0.11.25.tar.gz
     URL_HASH SHA256=b900edcffe979816e2560a0580b9b1216d674b4f17fbadeca8f777a7f8ab0274
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    ${PINGMOTE_FETCH_EXCLUDE_FROM_ALL}
 )
-FetchContent_MakeAvailable(miniaudio)
+pingmote_make_dependency_available(miniaudio)
 
 find_package(raylib 5.5 QUIET)
 if(NOT TARGET raylib)
@@ -68,8 +98,9 @@ if(NOT TARGET raylib)
         URL https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
         URL_HASH SHA256=aea98ecf5bc5c5e0b789a76de0083a21a70457050ea4cc2aec7566935f5e258e
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        ${PINGMOTE_FETCH_EXCLUDE_FROM_ALL}
     )
-    FetchContent_MakeAvailable(raylib)
+    pingmote_make_dependency_available(raylib)
 endif()
 
 if(TARGET raylib AND CMAKE_C_COMPILER_ID MATCHES "Clang")
@@ -91,8 +122,9 @@ if(NOT TARGET cjson AND NOT TARGET cjson-static)
         URL https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz
         URL_HASH SHA256=3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        ${PINGMOTE_FETCH_EXCLUDE_FROM_ALL}
     )
-    FetchContent_MakeAvailable(cjson)
+    pingmote_make_dependency_available(cjson)
 
     # Upstream's build target does not expose its source include directory.
     target_include_directories(cjson INTERFACE "${cjson_SOURCE_DIR}")
@@ -224,8 +256,9 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-install(TARGETS pingmote
-    BUNDLE DESTINATION .
-    RUNTIME DESTINATION bin
-)
-install(DIRECTORY assets/ DESTINATION share/pingmote/assets)
+if(APPLE)
+    install(TARGETS pingmote BUNDLE DESTINATION .)
+else()
+    install(TARGETS pingmote RUNTIME DESTINATION bin)
+    install(DIRECTORY assets/ DESTINATION share/pingmote/assets)
+endif()
